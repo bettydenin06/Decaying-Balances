@@ -6,6 +6,7 @@
 (define-constant ERR_MINT_FAILED (err u104))
 (define-constant ERR_RESCUE_ACTIVE (err u105))
 (define-constant ERR_RESCUE_LOCKED (err u106))
+(define-constant ERR_NO_REWARDS (err u107))
 
 (define-fungible-token decay-token)
 
@@ -24,12 +25,19 @@
     { rescued-amount: uint, unlock-block: uint }
 )
 
+(define-map user-activity
+    { user: principal }
+    { last-activity: uint, activity-score: uint }
+)
+
 (define-data-var token-name (string-ascii 32) "DecayToken")
 (define-data-var token-symbol (string-ascii 10) "DECAY")
 (define-data-var token-decimals uint u6)
 (define-data-var decay-rate uint u1000)
 (define-data-var decay-interval uint u144)
 (define-data-var total-supply uint u0)
+(define-data-var decay-reward-pool uint u0)
+(define-data-var total-activity-score uint u0)
 
 (define-private (get-current-block-height)
    stacks-block-height
@@ -56,7 +64,12 @@
               (last-update (get last-update balance-data))
               (current-block (get-current-block-height))
               (blocks-passed (- current-block last-update)))
-            (let ((new-balance (calculate-decay current-balance blocks-passed)))
+            (let ((new-balance (calculate-decay current-balance blocks-passed))
+                  (decay-amount (- current-balance new-balance)))
+                (if (> decay-amount u0)
+                    (var-set decay-reward-pool (+ (var-get decay-reward-pool) decay-amount))
+                    true
+                )
                 (map-set token-balances 
                     { owner: owner }
                     { balance: new-balance, last-update: current-block }
@@ -131,6 +144,35 @@
     )
 )
 
+(define-read-only (get-user-activity (user principal))
+    (map-get? user-activity { user: user })
+)
+
+(define-read-only (get-decay-reward-pool)
+    (var-get decay-reward-pool)
+)
+
+(define-read-only (get-total-activity-score)
+    (var-get total-activity-score)
+)
+
+(define-read-only (calculate-user-rewards (user principal))
+    (let ((activity-data (get-user-activity user))
+          (pool-size (get-decay-reward-pool))
+          (total-score (get-total-activity-score)))
+        (match activity-data
+            user-info
+            (let ((user-score (get activity-score user-info)))
+                (if (and (> pool-size u0) (> total-score u0) (> user-score u0))
+                    (/ (* pool-size user-score) total-score)
+                    u0
+                )
+            )
+            u0
+        )
+    )
+)
+
 (define-public (mint (recipient principal) (amount uint))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
@@ -144,6 +186,22 @@
         )
         (var-set total-supply (+ (var-get total-supply) amount))
         (ok amount)
+    )
+)
+
+(define-private (update-user-activity (user principal))
+    (let ((current-block (get-current-block-height))
+          (activity-data (default-to { last-activity: u0, activity-score: u0 }
+                                     (get-user-activity user))))
+        (let ((current-score (get activity-score activity-data))
+              (old-score current-score)
+              (new-score (+ current-score u1)))
+            (map-set user-activity
+                { user: user }
+                { last-activity: current-block, activity-score: new-score }
+            )
+            (var-set total-activity-score (+ (- (var-get total-activity-score) old-score) new-score))
+        )
     )
 )
 
@@ -164,6 +222,8 @@
                     { owner: recipient }
                     { balance: (+ recipient-balance amount), last-update: (get-current-block-height) }
                 )
+                (update-user-activity sender)
+                (update-user-activity recipient)
             )
         )
         (match memo to-print (print to-print) 0x)
@@ -179,6 +239,30 @@
             { allowance: amount }
         )
         (ok true)
+    )
+)
+
+(define-public (claim-decay-rewards)
+    (begin
+        (let ((reward-amount (calculate-user-rewards tx-sender)))
+            (asserts! (> reward-amount u0) ERR_NO_REWARDS)
+            (let ((current-balance (update-balance tx-sender))
+                  (activity-data (unwrap-panic (get-user-activity tx-sender))))
+                (let ((user-score (get activity-score activity-data)))
+                    (map-set token-balances 
+                        { owner: tx-sender }
+                        { balance: (+ current-balance reward-amount), last-update: (get-current-block-height) }
+                    )
+                    (var-set decay-reward-pool (- (var-get decay-reward-pool) reward-amount))
+                    (var-set total-activity-score (- (var-get total-activity-score) user-score))
+                    (map-set user-activity
+                        { user: tx-sender }
+                        { last-activity: (get-current-block-height), activity-score: u0 }
+                    )
+                    (ok reward-amount)
+                )
+            )
+        )
     )
 )
 
@@ -203,6 +287,8 @@
                     { owner: owner, spender: tx-sender }
                     { allowance: (- allowance amount) }
                 )
+                (update-user-activity owner)
+                (update-user-activity recipient)
             )
         )
         (match memo to-print (print to-print) 0x)
@@ -222,6 +308,7 @@
                 { balance: (- sender-balance amount), last-update: (get-current-block-height) }
             )
             (var-set total-supply (- (var-get total-supply) amount))
+            (update-user-activity tx-sender)
         )
         (ok amount)
     )
