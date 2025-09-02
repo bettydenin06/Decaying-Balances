@@ -7,6 +7,9 @@
 (define-constant ERR_RESCUE_ACTIVE (err u105))
 (define-constant ERR_RESCUE_LOCKED (err u106))
 (define-constant ERR_NO_REWARDS (err u107))
+(define-constant ERR_TRANSFER_NOT_FOUND (err u108))
+(define-constant ERR_TRANSFER_NOT_READY (err u109))
+(define-constant ERR_TRANSFER_ALREADY_EXISTS (err u110))
 
 (define-fungible-token decay-token)
 
@@ -28,6 +31,16 @@
 (define-map user-activity
     { user: principal }
     { last-activity: uint, activity-score: uint }
+)
+
+(define-map scheduled-transfers
+    { sender: principal, transfer-id: uint }
+    { recipient: principal, amount: uint, execute-block: uint }
+)
+
+(define-map user-scheduled-amount
+    { user: principal }
+    { locked-amount: uint }
 )
 
 (define-data-var token-name (string-ascii 32) "DecayToken")
@@ -126,20 +139,33 @@
 
 (define-read-only (get-available-balance (owner principal))
     (let ((total-balance (get-balance owner))
-          (rescue-data (get-rescue-lock owner)))
-        (match rescue-data 
-            rescue-info 
-            (let ((rescued-amount (get rescued-amount rescue-info))
-                  (unlock-block (get unlock-block rescue-info)))
-                (if (>= (get-current-block-height) unlock-block)
+          (rescue-data (get-rescue-lock owner))
+          (scheduled-data (map-get? user-scheduled-amount { user: owner })))
+        (let ((balance-after-rescue 
+                (match rescue-data 
+                    rescue-info 
+                    (let ((rescued-amount (get rescued-amount rescue-info))
+                          (unlock-block (get unlock-block rescue-info)))
+                        (if (>= (get-current-block-height) unlock-block)
+                            total-balance
+                            (if (>= total-balance rescued-amount)
+                                (- total-balance rescued-amount)
+                                u0
+                            )
+                        )
+                    )
                     total-balance
-                    (if (>= total-balance rescued-amount)
-                        (- total-balance rescued-amount)
+                )))
+            (match scheduled-data
+                scheduled-info
+                (let ((scheduled-amount (get locked-amount scheduled-info)))
+                    (if (>= balance-after-rescue scheduled-amount)
+                        (- balance-after-rescue scheduled-amount)
                         u0
                     )
                 )
+                balance-after-rescue
             )
-            total-balance
         )
     )
 )
@@ -171,6 +197,14 @@
             u0
         )
     )
+)
+
+(define-read-only (get-scheduled-transfer (sender principal) (transfer-id uint))
+    (map-get? scheduled-transfers { sender: sender, transfer-id: transfer-id })
+)
+
+(define-read-only (get-user-scheduled-amount (user principal))
+    (default-to u0 (get locked-amount (map-get? user-scheduled-amount { user: user })))
 )
 
 (define-public (mint (recipient principal) (amount uint))
@@ -358,6 +392,84 @@
             (let ((rescue-info (unwrap-panic rescue-data)))
                 (asserts! (>= (get-current-block-height) (get unlock-block rescue-info)) ERR_RESCUE_LOCKED)
                 (map-delete rescue-locks { owner: tx-sender })
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-public (schedule-transfer (recipient principal) (amount uint) (execute-block uint) (transfer-id uint))
+    (begin
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (> execute-block (get-current-block-height)) ERR_INVALID_AMOUNT)
+        (asserts! (is-none (get-scheduled-transfer tx-sender transfer-id)) ERR_TRANSFER_ALREADY_EXISTS)
+        (let ((current-balance (update-balance tx-sender))
+              (available-balance (get-available-balance tx-sender)))
+            (asserts! (>= available-balance amount) ERR_INSUFFICIENT_BALANCE)
+            (map-set scheduled-transfers
+                { sender: tx-sender, transfer-id: transfer-id }
+                { recipient: recipient, amount: amount, execute-block: execute-block }
+            )
+            (let ((current-locked (get-user-scheduled-amount tx-sender)))
+                (map-set user-scheduled-amount
+                    { user: tx-sender }
+                    { locked-amount: (+ current-locked amount) }
+                )
+            )
+            (ok transfer-id)
+        )
+    )
+)
+
+(define-public (execute-scheduled-transfer (sender principal) (transfer-id uint))
+    (begin
+        (let ((transfer-data (get-scheduled-transfer sender transfer-id)))
+            (asserts! (is-some transfer-data) ERR_TRANSFER_NOT_FOUND)
+            (let ((transfer-info (unwrap-panic transfer-data)))
+                (asserts! (>= (get-current-block-height) (get execute-block transfer-info)) ERR_TRANSFER_NOT_READY)
+                (let ((recipient (get recipient transfer-info))
+                      (amount (get amount transfer-info))
+                      (sender-balance (update-balance sender))
+                      (recipient-balance (update-balance recipient)))
+                    (asserts! (>= sender-balance amount) ERR_INSUFFICIENT_BALANCE)
+                    (try! (ft-transfer? decay-token amount sender recipient))
+                    (map-set token-balances
+                        { owner: sender }
+                        { balance: (- sender-balance amount), last-update: (get-current-block-height) }
+                    )
+                    (map-set token-balances
+                        { owner: recipient }
+                        { balance: (+ recipient-balance amount), last-update: (get-current-block-height) }
+                    )
+                    (let ((current-locked (get-user-scheduled-amount sender)))
+                        (map-set user-scheduled-amount
+                            { user: sender }
+                            { locked-amount: (- current-locked amount) }
+                        )
+                    )
+                    (map-delete scheduled-transfers { sender: sender, transfer-id: transfer-id })
+                    (update-user-activity sender)
+                    (update-user-activity recipient)
+                    (ok true)
+                )
+            )
+        )
+    )
+)
+
+(define-public (cancel-scheduled-transfer (transfer-id uint))
+    (begin
+        (let ((transfer-data (get-scheduled-transfer tx-sender transfer-id)))
+            (asserts! (is-some transfer-data) ERR_TRANSFER_NOT_FOUND)
+            (let ((transfer-info (unwrap-panic transfer-data))
+                  (amount (get amount (unwrap-panic transfer-data))))
+                (let ((current-locked (get-user-scheduled-amount tx-sender)))
+                    (map-set user-scheduled-amount
+                        { user: tx-sender }
+                        { locked-amount: (- current-locked amount) }
+                    )
+                )
+                (map-delete scheduled-transfers { sender: tx-sender, transfer-id: transfer-id })
                 (ok true)
             )
         )
