@@ -10,6 +10,8 @@
 (define-constant ERR_TRANSFER_NOT_FOUND (err u108))
 (define-constant ERR_TRANSFER_NOT_READY (err u109))
 (define-constant ERR_TRANSFER_ALREADY_EXISTS (err u110))
+(define-constant ERR_DELEGATION_EXISTS (err u111))
+(define-constant ERR_NO_DELEGATION (err u112))
 
 (define-fungible-token decay-token)
 
@@ -41,6 +43,11 @@
 (define-map user-scheduled-amount
     { user: principal }
     { locked-amount: uint }
+)
+
+(define-map delegations
+    { delegator: principal }
+    { delegate: principal, amount: uint }
 )
 
 (define-data-var token-name (string-ascii 32) "DecayToken")
@@ -205,6 +212,20 @@
 
 (define-read-only (get-user-scheduled-amount (user principal))
     (default-to u0 (get locked-amount (map-get? user-scheduled-amount { user: user })))
+)
+
+(define-read-only (get-delegation (delegator principal))
+    (map-get? delegations { delegator: delegator })
+)
+
+(define-read-only (get-delegated-balance (delegate principal))
+    (let ((all-delegators (list)))
+        u0
+    )
+)
+
+(define-read-only (get-voting-power (user principal))
+    (get-balance user)
 )
 
 (define-public (mint (recipient principal) (amount uint))
@@ -472,6 +493,51 @@
                 (map-delete scheduled-transfers { sender: tx-sender, transfer-id: transfer-id })
                 (ok true)
             )
+        )
+    )
+)
+
+(define-public (delegate-tokens (delegate principal) (amount uint))
+    (begin
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (not (is-eq tx-sender delegate)) ERR_INVALID_AMOUNT)
+        (asserts! (is-none (get-delegation tx-sender)) ERR_DELEGATION_EXISTS)
+        (let ((current-balance (get-balance tx-sender)))
+            (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
+            (map-set delegations
+                { delegator: tx-sender }
+                { delegate: delegate, amount: amount }
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (update-delegation (new-amount uint))
+    (begin
+        (asserts! (> new-amount u0) ERR_INVALID_AMOUNT)
+        (let ((delegation-data (get-delegation tx-sender)))
+            (asserts! (is-some delegation-data) ERR_NO_DELEGATION)
+            (let ((current-balance (get-balance tx-sender)))
+                (asserts! (>= current-balance new-amount) ERR_INSUFFICIENT_BALANCE)
+                (let ((delegation-info (unwrap-panic delegation-data)))
+                    (map-set delegations
+                        { delegator: tx-sender }
+                        { delegate: (get delegate delegation-info), amount: new-amount }
+                    )
+                    (ok true)
+                )
+            )
+        )
+    )
+)
+
+(define-public (revoke-delegation)
+    (begin
+        (let ((delegation-data (get-delegation tx-sender)))
+            (asserts! (is-some delegation-data) ERR_NO_DELEGATION)
+            (map-delete delegations { delegator: tx-sender })
+            (ok true)
         )
     )
 )
