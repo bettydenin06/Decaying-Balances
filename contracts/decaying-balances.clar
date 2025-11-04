@@ -35,6 +35,11 @@
     { last-activity: uint, activity-score: uint }
 )
 
+(define-map reward-cooldowns
+    { user: principal }
+    { last-claim: uint }
+)
+
 (define-map scheduled-transfers
     { sender: principal, transfer-id: uint }
     { recipient: principal, amount: uint, execute-block: uint }
@@ -58,6 +63,8 @@
 (define-data-var total-supply uint u0)
 (define-data-var decay-reward-pool uint u0)
 (define-data-var total-activity-score uint u0)
+
+(define-data-var reward-cooldown-interval uint u144)
 
 (define-private (get-current-block-height)
    stacks-block-height
@@ -189,6 +196,14 @@
     (var-get total-activity-score)
 )
 
+(define-read-only (get-reward-cooldown-interval)
+    (var-get reward-cooldown-interval)
+)
+
+(define-read-only (get-last-reward-claim (user principal))
+    (default-to u0 (get last-claim (map-get? reward-cooldowns { user: user })))
+)
+
 (define-read-only (calculate-user-rewards (user principal))
     (let ((activity-data (get-user-activity user))
           (pool-size (get-decay-reward-pool))
@@ -299,7 +314,11 @@
 
 (define-public (claim-decay-rewards)
     (begin
-        (let ((reward-amount (calculate-user-rewards tx-sender)))
+        (let ((reward-amount (calculate-user-rewards tx-sender))
+              (current-block (get-current-block-height))
+              (last-claim (default-to u0 (get last-claim (map-get? reward-cooldowns { user: tx-sender }))))
+              (interval (var-get reward-cooldown-interval)))
+            (asserts! (>= current-block (+ last-claim interval)) ERR_INVALID_AMOUNT)
             (asserts! (> reward-amount u0) ERR_NO_REWARDS)
             (let ((current-balance (update-balance tx-sender))
                   (activity-data (unwrap-panic (get-user-activity tx-sender))))
@@ -313,6 +332,10 @@
                     (map-set user-activity
                         { user: tx-sender }
                         { last-activity: (get-current-block-height), activity-score: u0 }
+                    )
+                    (map-set reward-cooldowns
+                        { user: tx-sender }
+                        { last-claim: current-block }
                     )
                     (ok reward-amount)
                 )
@@ -383,6 +406,15 @@
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
         (asserts! (> new-interval u0) ERR_INVALID_AMOUNT)
         (var-set decay-interval new-interval)
+        (ok true)
+    )
+)
+
+(define-public (set-reward-cooldown-interval (new-interval uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (> new-interval u0) ERR_INVALID_AMOUNT)
+        (var-set reward-cooldown-interval new-interval)
         (ok true)
     )
 )
